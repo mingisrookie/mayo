@@ -1,0 +1,214 @@
+name: Windows infinite-face test release
+
+on:
+  push:
+    tags:
+      - 'v*-infinite-faces.*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'New prerelease tag, or the tag of an unfinished draft'
+        required: false
+        default: v0.11.0-infinite-faces.1
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: infinite-face-release-${{ github.repository }}-${{ inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  windows-portable:
+    # This is a downstream testing workflow, never an upstream release workflow.
+    if: github.repository == 'mingisrookie/mayo' && github.event.repository.fork == true
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      OCCT_VERSION: 7.9.3
+      OCCT_URL: https://github.com/Open-Cascade-SAS/OCCT/releases/download/V7_9_3/opencascade-7.9.3-vc14-64-combined.zip
+      OCCT_SHA256: afbef3457fbc4a2bdca0608e0fe284392f51e4c2c42ccbfb9df7168d8e4eb9b3
+      MESA_URL: https://www.fougue.pro/share/bin/mesa3d-26.1.7-msvc-x64.zip
+      MESA_SHA256: c75afbaf82f7f9cbced08e879298243acebec89080c4e1fb481417357d7086fd
+
+    steps:
+      - name: Checkout the exact revision to release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release destination and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GH_REPO -ne 'mingisrookie/mayo') { throw 'Only the testing fork may publish this release.' }
+          $repo = gh api "repos/$env:GH_REPO" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or !$repo.fork -or $repo.parent.full_name -ne 'fougue/mayo') {
+            throw 'Expected a fork of fougue/mayo.'
+          }
+          $tag = if ($env:GITHUB_EVENT_NAME -eq 'push') { $env:GITHUB_REF_NAME } else { $env:REQUESTED_TAG }
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = 'v0.11.0-infinite-faces.1' }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+-infinite-faces\.\d+$') { throw 'Invalid testing-release tag.' }
+          $sha = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve source revision.' }
+          $existing = git rev-parse --verify --quiet "refs/tags/$tag^{commit}"
+          if ($LASTEXITCODE -eq 0 -and $existing.Trim() -ne $sha) { throw 'Existing tag points to a different revision.' }
+          "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
+          "RELEASE_COMMIT=$sha" >> $env:GITHUB_ENV
+          # A published release is immutable here; retries may resume only a draft.
+          $releases = gh api "repos/$env:GH_REPO/releases" --paginate | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect existing releases.' }
+          $release = @($releases | Where-Object tag_name -eq $tag)
+          if ($release.Count -gt 0 -and !$release[0].draft) { throw 'This tag already has a published release. Use a new tag.' }
+
+      - name: Install Qt 5.15.2 for MSVC x64
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125 # v4.4.1
+        with:
+          version: '5.15.2'
+          host: windows
+          target: desktop
+          arch: win64_msvc2019_64
+          cache: true
+          aqtversion: '==3.3.0'
+          py7zrversion: '==1.1.0'
+
+      - name: Set up MSVC x64
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
+
+      - name: Download and verify OCCT and CI-only Mesa
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $deps = Join-Path $env:RUNNER_TEMP 'mayo-release-deps'
+          New-Item $deps -ItemType Directory -Force | Out-Null
+          foreach ($dependency in @(
+            @{ Name = 'occt'; Url = $env:OCCT_URL; Sha = $env:OCCT_SHA256 },
+            @{ Name = 'mesa'; Url = $env:MESA_URL; Sha = $env:MESA_SHA256 }
+          )) {
+            $archive = Join-Path $deps ($dependency.Name + '.zip')
+            Invoke-WebRequest $dependency.Url -OutFile $archive
+            if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $dependency.Sha) {
+              throw "Checksum mismatch: $($dependency.Name)"
+            }
+            $destination = Join-Path $deps $dependency.Name
+            & 7z x $archive "-o$destination" -y | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Extraction failed: $($dependency.Name)" }
+          }
+          $occtRoots = @(Get-ChildItem (Join-Path $deps 'occt') -Filter env.bat -File -Recurse |
+            Where-Object { Test-Path (Join-Path $_.DirectoryName 'inc/Standard_Version.hxx') })
+          if ($occtRoots.Count -ne 1) { throw 'Cannot identify the unique OCCT binary distribution root.' }
+          # The official 7.9.3 ZIP accidentally points TK_DIR at its build machine's
+          # Git bin directory. Mayo copies every DLL in TK_DIR; use the bundled Tcl/Tk
+          # directory instead, without changing any OCCT library or header.
+          $customPath = Join-Path $occtRoots[0].DirectoryName 'custom_vc14_64.bat'
+          $custom = Get-Content $customPath -Raw
+          $badTk = 'set "TK_DIR=C:/Program Files/Git/mingw64/bin"'
+          if (!$custom.Contains($badTk)) { throw 'Unexpected OCCT environment script; review the pinned distribution.' }
+          $custom.Replace($badTk, 'set "TK_DIR=%THIRDPARTY_DIR%/tcltk-8.6.15-x64/bin"') |
+            Set-Content $customPath -Encoding ascii
+          $mesaGl = @(Get-ChildItem (Join-Path $deps 'mesa') -Filter opengl32.dll -File -Recurse)
+          if ($mesaGl.Count -ne 1) { throw 'Cannot identify the Mesa x64 directory.' }
+          $qtRoot = Split-Path (Split-Path (Get-Command qmake.exe).Source)
+          if ((& "$qtRoot/bin/qmake.exe" -query QT_VERSION).Trim() -ne '5.15.2') { throw 'Unexpected Qt version.' }
+          "OCCT_ROOT=$($occtRoots[0].DirectoryName)" >> $env:GITHUB_ENV
+          "OCCT_DISTRIBUTION=$(Join-Path $deps 'occt')" >> $env:GITHUB_ENV
+          "MESA_ROOT=$($mesaGl[0].DirectoryName)" >> $env:GITHUB_ENV
+          "RELEASE_QT_ROOT=$qtRoot" >> $env:GITHUB_ENV
+
+      - name: Configure Release and all regression tests
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 `
+            -DMayo_BuildApp=ON -DMayo_BuildConvCli=ON -DMayo_BuildTests=ON `
+            -DMayo_BuildPluginAssimp=OFF -DMayo_PostBuildCopyRuntimeDLLs=ON `
+            -DMayo_EnablePch=OFF '-DMayo_TestOutputFilenameTemplate=<test>-results.txt' `
+            "-DQT_DIR=$env:RELEASE_QT_ROOT/lib/cmake/Qt5" "-DOpenCASCADE_DIR=$env:OCCT_ROOT"
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
+
+      - name: Build Release
+        run: |
+          cmake --build build --config Release --parallel $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
+
+      - name: Run six CTests and capture the three STEP reproductions
+        run: |
+          ./scripts/package-windows-infinite-faces.ps1 -Phase Test `
+            -BuildDirectory build -QtRoot $env:RELEASE_QT_ROOT -OcctRoot $env:OCCT_ROOT `
+            -OcctDistribution $env:OCCT_DISTRIBUTION -MesaRoot $env:MESA_ROOT `
+            -ReleaseTag $env:RELEASE_TAG -OutputDirectory release-output
+
+      - name: Assemble and smoke-test the native-driver portable ZIP
+        run: |
+          ./scripts/package-windows-infinite-faces.ps1 -Phase Package `
+            -BuildDirectory build -QtRoot $env:RELEASE_QT_ROOT -OcctRoot $env:OCCT_ROOT `
+            -OcctDistribution $env:OCCT_DISTRIBUTION -ReleaseTag $env:RELEASE_TAG `
+            -OutputDirectory release-output
+
+      - name: Keep build and test evidence even if verification fails
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-infinite-faces-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            release-output/evidence/
+            release-output/assets/
+            build/test-*-results.txt
+            build/Testing/Temporary/LastTest.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish the verified prerelease in our fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GH_REPO -ne 'mingisrookie/mayo') { throw 'Release destination guard failed.' }
+          if (!(Test-Path release-output/evidence/package-smoke-passed.json)) { throw 'Package smoke test did not pass.' }
+          $assets = @(Get-ChildItem release-output/assets -File | ForEach-Object FullName)
+          if ($assets.Count -lt 3) { throw 'Expected portable ZIP, verification ZIP, and checksums.' }
+          $tag = $env:RELEASE_TAG
+          $notes = @"
+          ## Windows 实测版本：STEP 无限面显示修复
+
+          基于 Mayo 0.11.0 当前源码，使用 Qt 5.15.2、Open CASCADE 7.9.3、MSVC x64 Release 构建。
+          提交：$env:RELEASE_COMMIT
+
+          下载名称包含 windows-x64-portable 的 ZIP，完整解压后运行 Start-Mayo.cmd。
+          包内 samples 目录附有可公开分享的圆柱、平面、圆锥最小 STEP 复现；TESTING-zh-CN.txt 说明实际模型验证步骤。
+
+          此修复在显示和选择层处理无边界、无网格、无限参数域的面；不删除原始几何或整个零件。
+          自动验证包括全部 6 个 CTest、三种 STEP 的着色/边线/线框/模式切换/样式刷新截图和包围盒检查、显示前后完整 BREP 字节一致性，以及独立便携目录的 STEP 导入/导出 smoke test。
+          verification ZIP 包含测试日志、截图、统计和校验值。CI 图形测试使用 Mesa；便携包不包含 Mesa 的 opengl32.dll，实际查看使用您的显卡驱动。
+
+          这是我们的试用预发布版本。请用原始工业模型检查长线、适合窗口、着色和带边线模式、模式切换与选择，并反馈结果；验证通过后再考虑向官方提交 PR。
+          有意创建的无限、无边界且没有网格的面本身不再显示；有限面、正常线框、已有网格面仍保留。
+          此测试包未启用可选 Assimp 插件，STEP/IGES/BREP 等 OCCT 格式可用。
+          "@
+          $notes | Set-Content release-output/release-notes.md -Encoding utf8
+          $releases = gh api "repos/$env:GH_REPO/releases" --paginate | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect releases.' }
+          $existing = @($releases | Where-Object tag_name -eq $tag)
+          if ($existing.Count -gt 0) {
+            if (!$existing[0].draft) { throw 'Refusing to replace a published release.' }
+            gh release edit $tag --target $env:RELEASE_COMMIT --draft --prerelease --notes-file release-output/release-notes.md
+          } else {
+            gh release create $tag --target $env:RELEASE_COMMIT --draft --prerelease `
+              --title "Mayo $tag - Windows STEP infinite-face fix" --notes-file release-output/release-notes.md
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot create or update the release draft.' }
+          gh release upload $tag @assets --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Asset upload failed; leaving the release as a draft.' }
+          gh release edit $tag --draft=false --prerelease --latest=false
+          if ($LASTEXITCODE -ne 0) { throw 'Could not publish the verified prerelease.' }
+          gh release view $tag --json url --jq .url
